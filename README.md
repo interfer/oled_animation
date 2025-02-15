@@ -7,3 +7,6 @@ But never found the right code for *this type of display and accelerometer* so c
 ## How does it look like?
 
 ![Demo](grains_animated.gif)
+
+## TODO
+ - fix dissapearing grains in the corners
