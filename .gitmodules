@@ -1,6 +1,0 @@
-[submodule "lib/mpu6050"]
-	path = lib/mpu6050
-	url = https://github.com/witnessmenow/Arduino-MPU6050.git
-[submodule "lib/led_matrix"]
-	path = lib/led_matrix
-	url = https://github.com/2dom/PxMatrix.git

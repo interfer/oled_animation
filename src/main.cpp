@@ -1,374 +1,271 @@
 #include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "mpu_setup.h"
 
-/*******************************************************************
-    Falling sand animation using a 64x64 RGB Led Matrix,an ESP32 and
-    a MPU6050 module.
- *                                                                 *
-    Built using an ESP32 and using my own ESP32 Matrix Shield
-    https://www.tindie.com/products/brianlough/esp32-matrix-shield-mini-32/
-    
-    Adapted for the Matrix and MPU6050 by Brian Lough
-    YouTube: https://www.youtube.com/brianlough
-    Tindie: https://www.tindie.com/stores/brianlough/
-    Twitter: https://twitter.com/witnessmenow
- *******************************************************************/
+#define GRAINS_NUM         50
 
-// This was the original header from the Adafruit Learn guide this project 
-//  was based on
-//  https://learn.adafruit.com/matrix-led-sand/overview
-// --------------------------------------------------------------------------
-//  Animated 'sand' for Adafruit Feather.  Uses the following parts:
-//   - Feather 32u4 Basic Proto (adafruit.com/product/2771)
-//   - Charlieplex FeatherWing (adafruit.com/product/2965 - any color!)
-//   - LIS3DH accelerometer (2809)
-//   - 350 mAh LiPoly battery (2750)
-//   - SPDT Slide Switch (805)
-//
-// This is NOT good "learn from" code for the IS31FL3731; it is "squeeze
-// every last byte from the microcontroller" code.  If you're starting out,
-// download the Adafruit_IS31FL3731 and Adafruit_GFX libraries, which
-// provide functions for drawing pixels, lines, etc.
-//--------------------------------------------------------------------------
+#define SCREEN_WIDTH       128
+#define SCREEN_HEIGHT      64
+#define OLED_RESET         -1
+#define UPDATE_INTERVAL    40
+#define MOVEMENT_THRESHOLD 0.6
 
-#include <Wire.h>            // For I2C communication
+// Physics Parameters X(y),Y(z)
+#define AXIS_X             y
+#define AXIS_Y             z
+#define GRAVITY_SCALE      0.6  // Adjust gravity impact
+#define DEFAULT_FRICTION   0.95 // Default grain friction
+#define DAMPING_FACTOR     0.5
+#define COLLISION_PUSH     1    // Push intensity for overlapping grains
+#define GRAIN_MIN_SIZE     2
+#define GRAIN_MAX_SIZE     2
+#define GRAIN_SIZE         2
 
-
-//Adtional Libraries to install
-
-#include <MPU6050.h>
-// For communicating with the MPU6050
-//
-// You need to install my version from GitHub
-// https://github.com/witnessmenow/Arduino-MPU6050
-
-#define double_buffer // this must be enabled to stop flickering
-#include "../lib/led_matrix/PxMatrix.h"
-// The library for controlling the LED Matrix
-//
-// Can be installed from the library manager
-// https://github.com/2dom/PxMatrix
-
-// Adafruit GFX library is a dependancy for the PxMatrix Library
-// Can be installed from the library manager
-// https://github.com/adafruit/Adafruit-GFX-Library
-
-#include <img_buffer.h>
-
-#define N_GRAINS     1000 // Number of grains of sand
-#define WIDTH        64 // Display width in pixels
-#define HEIGHT       64 // Display height in pixels
-#define MAX_FPS      45 // Maximum redraw rate, frames/second
-
-// The 'sand' grains exist in an integer coordinate space that's 256X
-// the scale of the pixel grid, allowing them to move and interact at
-// less than whole-pixel increments.
-#define MAX_X (WIDTH  * 256 - 1) // Maximum X coordinate in grain space
-#define MAX_Y (HEIGHT * 256 - 1) // Maximum Y coordinate
 struct Grain {
-  int16_t  x,  y; // Position
-  int16_t vx, vy; // Velocity
-  uint16_t pos;
-  uint16_t colour;
-} grain[N_GRAINS];
+    int16_t x, y;
+    float vx, vy;
+    uint8_t size;
+    float friction;
+};
 
-// ----------------------------
-// Wiring and Display setup
-// ----------------------------
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_MPU6050 mpu;
 
-#define P_LAT 22
-#define P_A 19
-#define P_B 23
-#define P_C 18
-#define P_D 5
-#define P_E 15
-// #define P_OE 2
-#define P_OE 21 // Feather Huzzah
-hw_timer_t * timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+Grain grains[GRAINS_NUM];
+float baseX = 0, baseY = 0;
+// Gravity variables (dynamic values to be updated based on tilt)
+float gravityX = GRAVITY_SCALE;
+float gravityY = GRAVITY_SCALE;
 
-// This defines the 'on' time of the display is us. The larger this number,
-// the brighter the display. If too large the ESP will crash
-uint8_t display_draw_time = 10; //10-50 is usually fine
+SemaphoreHandle_t displayMutex;
+volatile bool dataReady = false;
 
-//PxMATRIX display(matrix_width, matrix_height, P_LAT, P_OE, P_A, P_B, P_C);
-//PxMATRIX display(64,32,P_LAT, P_OE,P_A,P_B,P_C,P_D);
-PxMATRIX display(64, 64, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
+// Update gravity based on accelerometer (dummy example, replace with real sensor readings)
+void updateGravity() {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-#define NUM_COLOURS 5
+    // Normalize accelerometer values for gravity scaling
+    gravityX = (GRAVITY_SCALE * (a.acceleration.AXIS_X - baseX));
+    gravityY = -(GRAVITY_SCALE * (a.acceleration.AXIS_Y - baseY));
+}
 
-uint16_t myRED = display.color565(255, 0, 0);
-uint16_t myGREEN = display.color565(0, 255, 0);
-uint16_t myBLUE = display.color565(0, 0, 255);
-uint16_t myMAGENTA = display.color565(255, 0, 255);
-uint16_t myYELLOW = display.color565(255, 255, 0);
-uint16_t myCYAN = display.color565(0, 255, 255);
+void calibrateSensor() {
+    int calibration_factor = 20;
+    sensors_event_t a, g, temp;
+    baseX = baseY = 0;
+    for (int i = 0; i < calibration_factor; i++) {
+        mpu.getEvent(&a, &g, &temp);
+        baseX += a.acceleration.AXIS_X;
+        baseY += -a.acceleration.AXIS_Y;
+        delay(10);
+    }
+    baseX /= calibration_factor;
+    baseY /= calibration_factor;
+}
 
-uint16_t myCOLORS[6]={myRED,myGREEN,myCYAN,myMAGENTA,myYELLOW,myBLUE};
+void initializeGrains() {
+    for (int i = 0; i < GRAINS_NUM; i++) {
+        bool placed;
+        do {
+            placed = true;
+            grains[i].x = random(0, SCREEN_WIDTH);
+            grains[i].y = random(0, SCREEN_HEIGHT);
+            // grains[i].size = random(GRAIN_MIN_SIZE, GRAIN_MAX_SIZE);
+            grains[i].size = GRAIN_SIZE;
+            grains[i].vx = 0;
+            grains[i].vy = 0;
+            grains[i].friction = DEFAULT_FRICTION;
 
-MPU6050 mpu;
-uint32_t        prevTime   = 0;      // Used for frames-per-second throttle
-uint16_t         backbuffer = 0,      // Index for double-buffered animation
-                 img[WIDTH * HEIGHT]; // Internal 'map' of pixels
+            for (int j = 0; j < i; j++) {
+                int dx = abs(grains[i].x - grains[j].x);
+                int dy = abs(grains[i].y - grains[j].y);
+                if (dx < (grains[i].size + grains[j].size) &&
+                    dy < (grains[i].size + grains[j].size)) {
+                    placed = false;
+                    break;
+                }
+            }
+        } while (!placed);
+    }
+}
 
-ImgBufferGFX imgWrapper(img, WIDTH, HEIGHT);
+void resolveCollision(Grain &g1, Grain &g2) {
+    float dx = g1.x - g2.x;
+    float dy = g1.y - g2.y;
+    float distance = sqrt(dx * dx + dy * dy);
+    float minDist = (g1.size + g2.size);
 
-float xOffset = -1350; 
-float yOffset = -2590;
+    if (distance < minDist) {
+        // Vertical stacking priority
+        if (abs(dy) > abs(dx)) {
+            // If vertical overlap is more significant, stack vertically
+            if (g1.y > g2.y) {
+                g1.y = g2.y + minDist;
+            } else {
+                g2.y = g1.y + minDist;
+            }
+            // Zero out vertical velocity to simulate resting
+            g1.vy = 0;
+            g2.vy = 0;
+        } else {
+            // Existing horizontal collision logic
+            float push = COLLISION_PUSH * (minDist - distance) / minDist;
+            g1.x += push * (dx / distance);
+            g1.y += push * (dy / distance);
+            g2.x -= push * (dx / distance);
+            g2.y -= push * (dy / distance);
+        }
+
+        // Dampen velocities
+        g1.vx *= DAMPING_FACTOR;
+        g1.vy *= DAMPING_FACTOR;
+        g2.vx *= DAMPING_FACTOR;
+        g2.vy *= DAMPING_FACTOR;
+    }
+}
+
+// Update physics with wall collision and gravity
+void updatePhysics(Grain &grain) {
+    // Apply gravity
+    grain.vx += gravityX * 0.2; 
+    grain.vy += gravityY * 0.2;
+
+    // Apply friction
+    grain.vx *= grain.friction;
+    grain.vy *= grain.friction;
+
+    // Update position
+    grain.x += grain.vx;
+    grain.y += grain.vy;
+
+    // Corner protection with explicit corner zone handling
+    // Left edge
+    if (grain.x < 0) {
+        grain.x = 0;
+        grain.vx = abs(grain.vx) * 0.5;
+    } 
+    // Right edge
+    else if (grain.x + grain.size > SCREEN_WIDTH) {
+        grain.x = SCREEN_WIDTH - grain.size;
+        grain.vx = -abs(grain.vx) * 0.5;
+    }
+
+    // Top edge
+    if (grain.y < 0) {
+        grain.y = 0;
+        grain.vy = abs(grain.vy) * 0.5;
+    }
+    // Bottom edge
+    else if (grain.y + grain.size > SCREEN_HEIGHT) {
+        grain.y = SCREEN_HEIGHT - grain.size;
+        grain.vy = -abs(grain.vy) * 0.5;
+    }
+
+    // Additional corner stabilization
+    // Top-left corner
+    if (grain.x < 0 && grain.y < 0) {
+        grain.x = 0;
+        grain.y = 0;
+        grain.vx = max(0.0f, grain.vx);
+        grain.vy = max(0.0f, grain.vy);
+    }
+    // Top-right corner
+    else if (grain.x + grain.size > SCREEN_WIDTH && grain.y < 0) {
+        grain.x = SCREEN_WIDTH - grain.size;
+        grain.y = 0;
+        grain.vx = min(0.0f, grain.vx);
+        grain.vy = max(0.0f, grain.vy);
+    }
+    // Bottom-left corner
+    else if (grain.x < 0 && grain.y + grain.size > SCREEN_HEIGHT) {
+        grain.x = 0;
+        grain.y = SCREEN_HEIGHT - grain.size;
+        grain.vx = max(0.0f, grain.vx);
+        grain.vy = min(0.0f, grain.vy);
+    }
+    // Bottom-right corner
+    else if (grain.x + grain.size > SCREEN_WIDTH && grain.y + grain.size > SCREEN_HEIGHT) {
+        grain.x = SCREEN_WIDTH - grain.size;
+        grain.y = SCREEN_HEIGHT - grain.size;
+        grain.vx = min(0.0f, grain.vx);
+        grain.vy = min(0.0f, grain.vy);
+    }
+}
 
 void pixelTask(void *param) {
+    MPU_setup(&mpu);
+    calibrateSensor();
 
-  while (!mpu.begin(MPU6050_SCALE_2000DPS, MPU6050_RANGE_4G, MPU6050_ADDRESS, 27, 33))
-  {
-    //Serial.println("Could not find a valid MPU6050 sensor, check wiring!");
-    delay(500);
-  }
+    while (true) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
 
- Vector accelVector = mpu.readRawAccel();
+        updateGravity();
 
-  float xOffset = (accelVector.XAxis * -1) * -1;
-  float yOffset = (accelVector.YAxis * -1) * -1;
-  
-  
-  while (true) {
-      // Limit the animation frame rate to MAX_FPS.  Because the subsequent sand
-  // calculations are non-deterministic (don't always take the same amount
-  // of time, depending on their current states), this helps ensure that
-  // things like gravity appear constant in the simulation.
-  uint32_t t;
-  while (((t = micros()) - prevTime) < (1000000L / MAX_FPS));
-  prevTime = t;
-
-  //  // Display frame rendered on prior pass.  It's done immediately after the
-  //  // FPS sync (rather than after rendering) for consistent animation timing.
-  //  pageSelect(0x0B);       // Function registers
-  //  writeRegister(0x01);    // Picture Display reg
-  //  Wire.write(backbuffer); // Page # to display
-  //  Wire.endTransmission();
-  //  backbuffer = 1 - backbuffer; // Swap front/back buffer index
-
-  // Read accelerometer...
-  //Vector accelVector = mpu.readNormalizeAccel();
-  Vector accelVector = mpu.readRawAccel();
-
-  float accelX = (accelVector.XAxis * -1) + xOffset;
-  float accelY = (accelVector.YAxis * -1) + yOffset;
-  float accelZ = accelVector.ZAxis;
-
-  int16_t ax = -accelY / 256,      // Transform accelerometer axes
-          ay =  accelX / 256,      // to grain coordinate space
-          az = abs(accelZ) / 2048; // Random motion factor
-  az = (az >= 3) ? 1 : 4 - az;      // Clip & invert
-  ax -= az;                         // Subtract motion factor from X, Y
-  ay -= az;
-  int16_t az2 = az * 2 + 1;         // Range of random motion to add back in
-
-  // ...and apply 2D accel vector to grain velocities...
-  int32_t v2; // Velocity squared
-  float   v;  // Absolute velocity
-  for (int i = 0; i < N_GRAINS; i++) {
-    grain[i].vx += ax + random(az2); // A little randomness makes
-    grain[i].vy += ay + random(az2); // tall stacks topple better!
-    // Terminal velocity (in any direction) is 256 units -- equal to
-    // 1 pixel -- which keeps moving grains from passing through each other
-    // and other such mayhem.  Though it takes some extra math, velocity is
-    // clipped as a 2D vector (not separately-limited X & Y) so that
-    // diagonal movement isn't faster
-    v2 = (int32_t)grain[i].vx * grain[i].vx + (int32_t)grain[i].vy * grain[i].vy;
-    if (v2 > 65536) { // If v^2 > 65536, then v > 256
-      v = sqrt((float)v2); // Velocity vector magnitude
-      grain[i].vx = (int)(256.0 * (float)grain[i].vx / v); // Maintain heading
-      grain[i].vy = (int)(256.0 * (float)grain[i].vy / v); // Limit magnitude
-    }
-  }
-
-  // ...then update position of each grain, one at a time, checking for
-  // collisions and having them react.  This really seems like it shouldn't
-  // work, as only one grain is considered at a time while the rest are
-  // regarded as stationary.  Yet this naive algorithm, taking many not-
-  // technically-quite-correct steps, and repeated quickly enough,
-  // visually integrates into something that somewhat resembles physics.
-  // (I'd initially tried implementing this as a bunch of concurrent and
-  // "realistic" elastic collisions among circular grains, but the
-  // calculations and volument of code quickly got out of hand for both
-  // the tiny 8-bit AVR microcontroller and my tiny dinosaur brain.)
-
-  uint16_t        i, bytes, oldidx, newidx, delta;
-  int16_t        newx, newy;
-
-  for (i = 0; i < N_GRAINS; i++) {
-    newx = grain[i].x + grain[i].vx; // New position in grain space
-    newy = grain[i].y + grain[i].vy;
-    if (newx > MAX_X) {              // If grain would go out of bounds
-      newx         = MAX_X;          // keep it inside, and
-      grain[i].vx /= -2;             // give a slight bounce off the wall
-    } else if (newx < 0) {
-      newx         = 0;
-      grain[i].vx /= -2;
-    }
-    if (newy > MAX_Y) {
-      newy         = MAX_Y;
-      grain[i].vy /= -2;
-    } else if (newy < 0) {
-      newy         = 0;
-      grain[i].vy /= -2;
-    }
-
-    oldidx = (grain[i].y / 256) * WIDTH + (grain[i].x / 256); // Prior pixel #
-    newidx = (newy      / 256) * WIDTH + (newx      / 256); // New pixel #
-    if ((oldidx != newidx) && // If grain is moving to a new pixel...
-        img[newidx]) {       // but if that pixel is already occupied...
-      delta = abs(newidx - oldidx); // What direction when blocked?
-      if (delta == 1) {           // 1 pixel left or right)
-        newx         = grain[i].x;  // Cancel X motion
-        grain[i].vx /= -2;          // and bounce X velocity (Y is OK)
-        newidx       = oldidx;      // No pixel change
-      } else if (delta == WIDTH) { // 1 pixel up or down
-        newy         = grain[i].y;  // Cancel Y motion
-        grain[i].vy /= -2;          // and bounce Y velocity (X is OK)
-        newidx       = oldidx;      // No pixel change
-      } else { // Diagonal intersection is more tricky...
-        // Try skidding along just one axis of motion if possible (start w/
-        // faster axis).  Because we've already established that diagonal
-        // (both-axis) motion is occurring, moving on either axis alone WILL
-        // change the pixel index, no need to check that again.
-        if ((abs(grain[i].vx) - abs(grain[i].vy)) >= 0) { // X axis is faster
-          newidx = (grain[i].y / 256) * WIDTH + (newx / 256);
-          if (!img[newidx]) { // That pixel's free!  Take it!  But...
-            newy         = grain[i].y; // Cancel Y motion
-            grain[i].vy /= -2;         // and bounce Y velocity
-          } else { // X pixel is taken, so try Y...
-            newidx = (newy / 256) * WIDTH + (grain[i].x / 256);
-            if (!img[newidx]) { // Pixel is free, take it, but first...
-              newx         = grain[i].x; // Cancel X motion
-              grain[i].vx /= -2;         // and bounce X velocity
-            } else { // Both spots are occupied
-              newx         = grain[i].x; // Cancel X & Y motion
-              newy         = grain[i].y;
-              grain[i].vx /= -2;         // Bounce X & Y velocity
-              grain[i].vy /= -2;
-              newidx       = oldidx;     // Not moving
-            }
-          }
-        } else { // Y axis is faster, start there
-          newidx = (newy / 256) * WIDTH + (grain[i].x / 256);
-          if (!img[newidx]) { // Pixel's free!  Take it!  But...
-            newx         = grain[i].x; // Cancel X motion
-            grain[i].vy /= -2;         // and bounce X velocity
-          } else { // Y pixel is taken, so try X...
-            newidx = (grain[i].y / 256) * WIDTH + (newx / 256);
-            if (!img[newidx]) { // Pixel is free, take it, but first...
-              newy         = grain[i].y; // Cancel Y motion
-              grain[i].vy /= -2;         // and bounce Y velocity
-            } else { // Both spots are occupied
-              newx         = grain[i].x; // Cancel X & Y motion
-              newy         = grain[i].y;
-              grain[i].vx /= -2;         // Bounce X & Y velocity
-              grain[i].vy /= -2;
-              newidx       = oldidx;     // Not moving
-            }
-          }
+        // Update physics for all grains
+        for (int i = 0; i < GRAINS_NUM; i++) {
+            updatePhysics(grains[i]);
         }
-      }
+
+        // Handle collisions between grains
+        for (int i = 0; i < GRAINS_NUM - 1; i++) {
+            for (int j = i + 1; j < GRAINS_NUM; j++) {
+                resolveCollision(grains[i], grains[j]);
+            }
+        }
+
+        xSemaphoreTake(displayMutex, portMAX_DELAY);
+        dataReady = true;
+        xSemaphoreGive(displayMutex);
+
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_INTERVAL));
     }
-    grain[i].x  = newx; // Update grain position
-    grain[i].y  = newy;
-    img[oldidx] = 0;    // Clear old spot (might be same as new, that's OK)
-    img[newidx] = 255;  // Set new spot
-    grain[i].pos = newidx;
-    //Serial.println(newidx);
-  }
-  }
 }
 
-void IRAM_ATTR display_updater() {
-  display.display(display_draw_time);
+void setup() {
+    delay(1000);
+    Serial.begin(115200);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("OLED initialization failed!");
+        while (true) delay(10);
+    }
+
+    initializeGrains();
+    displayMutex = xSemaphoreCreateMutex();
+
+    xTaskCreatePinnedToCore(pixelTask, "PixelTask", 8192, NULL, 1, NULL, 0);
 }
-
-void display_update_enable(bool is_enable)
-{
-  if (is_enable)
-  {
-    timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(timer, &display_updater, true);
-    timerAlarmWrite(timer, 2000, true);
-    timerAlarmEnable(timer);
-  }
-  else
-  {
-    timerDetachInterrupt(timer);
-    timerAlarmDisable(timer);
-  }
-}
-
-// SETUP - RUNS ONCE AT PROGRAM START --------------------------------------
-
-void setup(void) {
-  int i, j, bytes;
-
-
-  //Serial.begin(115200);
-
-  //Serial.println("Initialize MPU6050");
-
-  // Define your display layout here, e.g. 1/8 step
-  display.begin(32);
-
-  display.setFastUpdate(true);
-  display.clearDisplay();
-  display_update_enable(true);
-  display.showBuffer();
-
-  memset(img, 0, sizeof(img)); // Clear the img[] array
-
-  imgWrapper.setCursor(12, 18);
-  imgWrapper.setTextColor(myBLUE);
-  imgWrapper.setTextSize(4);
-  imgWrapper.print("HI");
-  
-  for (i = 0; i < N_GRAINS; i++) { // For each sand grain...
-
-    int imgIndex = 0;
-    do {
-      grain[i].x = random(WIDTH  * 256); // Assign random position within
-      grain[i].y = random(HEIGHT * 256); // the 'grain' coordinate space
-      // Check if corresponding pixel position is already occupied...
-      for (j = 0; (j < i) && (((grain[i].x / 256) != (grain[j].x / 256)) ||
-                              ((grain[i].y / 256) != (grain[j].y / 256))); j++);
-      imgIndex = (grain[i].y / 256) * WIDTH + (grain[i].x / 256);
-    } while (img[imgIndex] != 0); // Keep retrying until a clear spot is found
-    img[imgIndex] = 255; // Mark it
-    grain[i].pos = (grain[i].y / 256) * WIDTH + (grain[i].x / 256);
-    grain[i].vx = grain[i].vy = 0; // Initial velocity is zero
-    
-    grain[i].colour = myCOLORS[i%NUM_COLOURS];
-  }
-
-  //imgWrapper.drawChar(24,24, 'u', myBLUE, 0, 3);
-  
-
-  //imgWrapper.fillRect(24, 24, 16, 16, myBLUE);
-
-  TaskHandle_t xHandle = NULL;
-  xTaskCreatePinnedToCore(pixelTask, "PixelTask1", 5000, 0, (2 | portPRIVILEGE_BIT), &xHandle, 0);
-}
-
-// MAIN LOOP - RUNS ONCE PER FRAME OF ANIMATION ----------------------------
 
 void loop() {
+    static uint32_t lastUpdate = 0;
 
-  display.clearDisplay();
-  //display.drawChar(24,24, 'u', myBLUE, 0, 3);
-  for (int i = 0; i < N_GRAINS; i++) {
-    int yPos = grain[i].pos / WIDTH;
-    int xPos = grain[i].pos % WIDTH;
-    display.drawPixel(xPos , yPos, grain[i].colour);
-  }
-  //display.drawChar(24,24, 'u', myBLUE, 0, 3);
-  //display.fillRect(24, 24, 16, 16, myBLUE);
+    if (xSemaphoreTake(displayMutex, 0) == pdTRUE) {
+        if (dataReady && (millis() - lastUpdate >= UPDATE_INTERVAL)) {
+            display.clearDisplay();
+            for (int i = 0; i < GRAINS_NUM; i++) {
+                int x = grains[i].x;
+                int y = grains[i].y;
+                for (int dx = 0; dx < grains[i].size; dx++) {
+                    for (int dy = 0; dy < grains[i].size; dy++) {
+                        if (x + dx < SCREEN_WIDTH && y + dy < SCREEN_HEIGHT)
+                            display.drawPixel(x + dx, y + dy, WHITE);
+                    }
+                }
+            }
+            display.display();
+            dataReady = false;
 
-  display.setCursor(12, 18);
-  display.setTextColor(myBLUE);
-  display.setTextSize(4);
-  display.print("HI");
-  display.showBuffer();
+            lastUpdate = millis();
+        }
+        xSemaphoreGive(displayMutex);
+    }
+    yield();
 }
