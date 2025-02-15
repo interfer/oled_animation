@@ -9,7 +9,6 @@
 void MPU_setup(Adafruit_MPU6050 *mpu) {
     Serial.println("Adafruit MPU6050 test!");
 
-    // Try to initialize!
     if (!mpu->begin()) {
         Serial.println("Failed to find MPU6050 chip");
         while (1) {
